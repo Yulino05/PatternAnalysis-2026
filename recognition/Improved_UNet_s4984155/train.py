@@ -118,13 +118,17 @@ def train_epoch(
     optimizer: optim.Optimizer,
     criterion: nn.Module,
     device: torch.device,
+    epoch: int = 1,
+    total_epochs: int = 50,
     use_deep_supervision: bool = True
 ) -> float:
     """Runs a single training epoch across all mini-batches."""
     model.train()
     running_loss = 0.0
+    total_batches = len(loader)
+    log_interval = max(1, total_batches // 4)
 
-    for images, masks in loader:
+    for batch_idx, (images, masks) in enumerate(loader):
         images = images.to(device)
         masks = masks.to(device)
 
@@ -145,6 +149,9 @@ def train_epoch(
         optimizer.step()
 
         running_loss += loss.item() * images.size(0)
+
+        if (batch_idx + 1) % log_interval == 0 or (batch_idx + 1) == total_batches:
+            print(f"  --> [Ep {epoch:02d}/{total_epochs:02d}] Step [{batch_idx+1:03d}/{total_batches:03d}] Mini-batch Loss: {loss.item():.4f}", flush=True)
 
     epoch_loss = running_loss / len(loader.dataset)
     return epoch_loss
@@ -233,6 +240,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=16, help="Mini-batch size")
     parser.add_argument("--lr", type=float, default=1e-3, help="Initial learning rate")
     parser.add_argument("--data_dir", type=str, default="", help="Path to keras_slices_data directory")
+    parser.add_argument("--num_workers", type=int, default=0, help="Number of DataLoader workers (0 is optimal with in-memory cache)")
     parser.add_argument("--save_dir", type=str, default=".", help="Directory to save checkpoints and plots")
     parser.add_argument("--no_deep_supervision", action="store_true", help="Disable deep supervision")
 
@@ -240,12 +248,12 @@ def main():
 
     # Determine hardware device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"================================================================")
-    print(f"Starting Training Process on Device: {device}")
+    print("=" * 65, flush=True)
+    print(f"Starting Training Process on Device: {device}", flush=True)
     if torch.cuda.is_available():
-        print(f"GPU Name: {torch.cuda.get_device_name(0)}")
-    print(f"Model: {args.model.upper()} | Epochs: {args.epochs} | Batch Size: {args.batch_size}")
-    print(f"================================================================")
+        print(f"GPU Name: {torch.cuda.get_device_name(0)}", flush=True)
+    print(f"Model: {args.model.upper()} | Epochs: {args.epochs} | Batch Size: {args.batch_size} | Workers: {args.num_workers}", flush=True)
+    print("=" * 65, flush=True)
 
     # Determine dataset root path
     if args.data_dir:
@@ -260,11 +268,11 @@ def main():
         raise FileNotFoundError(f"Data root directory not found: {data_path}")
 
     # Load data loaders
-    print(f"[Data Loading] Initializing loaders from: {data_path}")
+    print(f"[Data Loading] Initializing loaders from: {data_path}", flush=True)
     train_loader, val_loader, test_loader = get_data_loaders(
         data_root=data_path,
         batch_size=args.batch_size,
-        num_workers=4 if torch.cuda.is_available() else 0,
+        num_workers=args.num_workers,
         target_size=(256, 128),
         prostate_only=True
     )
@@ -281,7 +289,7 @@ def main():
 
     model = model.to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"[Model Loaded] {model_name} initialized with {num_params:,} trainable parameters.")
+    print(f"[Model Loaded] {model_name} initialized with {num_params:,} trainable parameters.", flush=True)
 
     # Setup loss, optimizer, and scheduler
     criterion = CombinedBCEDiceLoss(bce_weight=1.0, dice_weight=1.0)
@@ -306,7 +314,7 @@ def main():
     for epoch in range(1, args.epochs + 1):
         ep_start = time.time()
 
-        train_loss = train_epoch(model, train_loader, optimizer, criterion, device, use_deep_supervision)
+        train_loss = train_epoch(model, train_loader, optimizer, criterion, device, epoch=epoch, total_epochs=args.epochs, use_deep_supervision=use_deep_supervision)
         val_loss, val_dice, val_iou = validate(model, val_loader, criterion, device)
         scheduler.step()
 
@@ -320,23 +328,23 @@ def main():
 
         print(f"Epoch [{epoch:02d}/{args.epochs:02d}] ({ep_duration:.1f}s) | "
               f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-              f"Val Dice: {val_dice:.4f} | Val IoU: {val_iou:.4f}")
+              f"Val Dice: {val_dice:.4f} | Val IoU: {val_iou:.4f}", flush=True)
 
         # Save checkpoint if best validation Dice is achieved
         if val_dice > best_val_dice:
             best_val_dice = val_dice
             torch.save(model.state_dict(), checkpoint_path)
-            print(f"  --> [Saved Best Model] Val Dice improved to {val_dice:.4f}! Weights saved to {checkpoint_path}")
+            print(f"  --> [Saved Best Model] Val Dice improved to {val_dice:.4f}! Weights saved to {checkpoint_path}", flush=True)
 
     total_time = time.time() - start_time
-    print(f"================================================================")
-    print(f"Training Complete! Total Elapsed Time: {total_time/60:.2f} minutes.")
-    print(f"Best Validation Prostate Dice (DSC): {best_val_dice:.4f}")
+    print("=" * 65, flush=True)
+    print(f"Training Complete! Total Elapsed Time: {total_time/60:.2f} minutes.", flush=True)
+    print(f"Best Validation Prostate Dice (DSC): {best_val_dice:.4f}", flush=True)
 
     if torch.cuda.is_available():
         peak_vram = torch.cuda.max_memory_allocated(device=device) / (1024 ** 2)
-        print(f"Peak GPU VRAM Usage: {peak_vram:.2f} MB")
-    print(f"================================================================")
+        print(f"Peak GPU VRAM Usage: {peak_vram:.2f} MB", flush=True)
+    print("=" * 65, flush=True)
 
     # Generate and save convergence plot
     plot_training_history(history, plot_path, model_name)

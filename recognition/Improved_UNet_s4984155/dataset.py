@@ -43,7 +43,8 @@ class HipMRI2DSliceDataset(Dataset):
         mask_dir: str,
         is_train: bool = False,
         target_size: Optional[Tuple[int, int]] = (256, 128),
-        prostate_only: bool = True
+        prostate_only: bool = True,
+        use_cache: bool = True
     ):
         """
         :param image_dir: Directory containing input MRI slice Nifti files.
@@ -51,12 +52,15 @@ class HipMRI2DSliceDataset(Dataset):
         :param is_train: Whether training augmentations should be applied.
         :param target_size: Output spatial resolution (H, W). Default (256, 128).
         :param prostate_only: If True, returns binary prostate mask [1, H, W] for Dice >= 0.75 target.
+        :param use_cache: If True, caches preprocessed tensors in RAM for ultra-fast multi-epoch training.
         """
         self.image_dir = image_dir
         self.mask_dir = mask_dir
         self.is_train = is_train
         self.target_size = target_size
         self.prostate_only = prostate_only
+        self.use_cache = use_cache
+        self.cache = {}
 
         # Find all .nii or .nii.gz files
         self.image_files = sorted(
@@ -91,34 +95,44 @@ class HipMRI2DSliceDataset(Dataset):
         return data.astype(np.float32)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        img_path = self.image_files[idx]
-        mask_path = self.mask_files[idx]
+        if self.use_cache and idx in self.cache:
+            image_tensor, mask_tensor = self.cache[idx]
+        else:
+            img_path = self.image_files[idx]
+            mask_path = self.mask_files[idx]
 
-        # 1. Load Nifti slices via Nibabel
-        image_np = self._load_nifti(img_path)
-        mask_np = self._load_nifti(mask_path)
+            # 1. Load Nifti slices via Nibabel
+            image_np = self._load_nifti(img_path)
+            mask_np = self._load_nifti(mask_path)
 
-        # 2. Extract prostate mask if binary target
-        if self.prostate_only:
-            # Binary mask: 1.0 for prostate (label 5), 0.0 otherwise
-            mask_np = (mask_np == self.PROSTATE_LABEL).astype(np.float32)
+            # 2. Extract prostate mask if binary target
+            if self.prostate_only:
+                # Binary mask: 1.0 for prostate (label 5), 0.0 otherwise
+                mask_np = (mask_np == self.PROSTATE_LABEL).astype(np.float32)
 
-        # 3. Intensity normalization (Listing 1, lines 46-47)
-        mean = image_np.mean()
-        std = image_np.std() + 1e-8
-        image_np = (image_np - mean) / std
+            # 3. Intensity normalization (Listing 1, lines 46-47)
+            mean = image_np.mean()
+            std = image_np.std() + 1e-8
+            image_np = (image_np - mean) / std
 
-        # 4. Convert NumPy arrays to PyTorch Tensors [1, H, W]
-        image_tensor = torch.from_numpy(image_np).unsqueeze(0)  # [1, H, W]
-        mask_tensor = torch.from_numpy(mask_np).unsqueeze(0)   # [1, H, W]
+            # 4. Convert NumPy arrays to PyTorch Tensors [1, H, W]
+            image_tensor = torch.from_numpy(image_np).unsqueeze(0)  # [1, H, W]
+            mask_tensor = torch.from_numpy(mask_np).unsqueeze(0)   # [1, H, W]
 
-        # 5. Resize to standard target size if specified
-        if self.target_size is not None and image_tensor.shape[1:] != self.target_size:
-            image_tensor = TF.resize(image_tensor, self.target_size, interpolation=TF.InterpolationMode.BILINEAR)
-            mask_tensor = TF.resize(mask_tensor, self.target_size, interpolation=TF.InterpolationMode.NEAREST)
+            # 5. Resize to standard target size if specified
+            if self.target_size is not None and image_tensor.shape[1:] != self.target_size:
+                image_tensor = TF.resize(image_tensor, self.target_size, interpolation=TF.InterpolationMode.BILINEAR)
+                mask_tensor = TF.resize(mask_tensor, self.target_size, interpolation=TF.InterpolationMode.NEAREST)
+
+            if self.use_cache:
+                self.cache[idx] = (image_tensor, mask_tensor)
 
         # 6. Synchronized Data Augmentation for Training
         if self.is_train:
+            # Clone cached tensors before applying stochastic spatial transforms
+            image_tensor = image_tensor.clone()
+            mask_tensor = mask_tensor.clone()
+
             # Horizontal Flip (50% prob)
             if random.random() > 0.5:
                 image_tensor = TF.hflip(image_tensor)
@@ -145,9 +159,10 @@ class HipMRI2DSliceDataset(Dataset):
 def get_data_loaders(
     data_root: str,
     batch_size: int = 16,
-    num_workers: int = 2,
+    num_workers: int = 0,
     target_size: Tuple[int, int] = (256, 128),
-    prostate_only: bool = True
+    prostate_only: bool = True,
+    use_cache: bool = True
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
     Constructs train, validation, and test DataLoaders for HipMRI 2D slices.
@@ -194,9 +209,9 @@ def get_data_loaders(
     print(f"  - Unique Test patients:  {len(test_pts)}")
 
     # Instantiate datasets
-    train_dataset = HipMRI2DSliceDataset(train_img_dir, train_mask_dir, is_train=True, target_size=target_size, prostate_only=prostate_only)
-    val_dataset = HipMRI2DSliceDataset(val_img_dir, val_mask_dir, is_train=False, target_size=target_size, prostate_only=prostate_only)
-    test_dataset = HipMRI2DSliceDataset(test_img_dir, test_mask_dir, is_train=False, target_size=target_size, prostate_only=prostate_only)
+    train_dataset = HipMRI2DSliceDataset(train_img_dir, train_mask_dir, is_train=True, target_size=target_size, prostate_only=prostate_only, use_cache=use_cache)
+    val_dataset = HipMRI2DSliceDataset(val_img_dir, val_mask_dir, is_train=False, target_size=target_size, prostate_only=prostate_only, use_cache=use_cache)
+    test_dataset = HipMRI2DSliceDataset(test_img_dir, test_mask_dir, is_train=False, target_size=target_size, prostate_only=prostate_only, use_cache=use_cache)
 
     train_loader = DataLoader(
         train_dataset,
